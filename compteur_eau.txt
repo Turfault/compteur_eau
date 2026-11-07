@@ -1,0 +1,591 @@
+/**
+ * Compteur d'eau — réservoir bateau
+ * Carte   : Waveshare ESP32-S3-Touch-LCD-4.3B (rev 1.1)
+ *Board "ESP32S3 Dev Module" — USB CDC On Boot: Enabled
+ *PSRAM: OPI PSRAM — Flash Size: 16MB
+ *USB CDC On Boot -> enabled
+ *USB DFU On Boot -> disabled
+ *USB Mode        -> Hardware CDC and JTAG
+ *Flash Mode      -> QIO 80MHz
+ *Flash Size      -> 16MB (128MB)
+ *Partition Scheme-> 16M Flash (3MB APP/9.9MB FATFS) ou Huge APP
+ *PSRAM           -> OPI PSRAM ← important pour l'écran RGB, sans ça l'affichage plante
+ *PSRAM Speed     -> 120MHz (Octal)
+ *UPLOAD Speed    -> 921600 (ou 460800 si le téléversement est instable)
+ *UPLOAD Mode     -> UART0 / Hardware CDC
+ *Core Debug Level-> None
+ *Erase All Flash Before Sketch Upload -> Disabled
+ *Events Run On    -> Core1
+ *Arduino Runs On  -> Core1
+
+
+         
+ * Capteur : YF-S201 / ZJ-S201 (débitmètre Hall 1/2", ~450 impulsions / litre)
+ *
+ * BRANCHEMENT DU CAPTEUR (l'écran occupe presque tous les GPIO,
+ * on utilise donc l'entrée isolée DI0 du bornier, lue via le CH422G) :
+ *   fil ROUGE   -> 5V
+ *   fil NOIR    -> GND
+ *   fil JAUNE   -> DI+ du bornier DI0
+ *   DI-         -> GND
+ 
+ */
+
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <Preferences.h>
+#include <WiFi.h>
+
+#include "esp_lcd_panel_rgb.h"
+#include <esp_display_panel.hpp>
+#include <lvgl.h>
+
+#include "lvgl_v8_port.h"    // fourni par l'exemple 09_lvgl_Porting
+LV_FONT_DECLARE(montserrat_14_acc);
+
+using namespace esp_panel::drivers;
+using namespace esp_panel::board;
+
+// ===================== CONFIGURATION =====================
+// Capteur
+#define PULSES_PER_LITRE  485.0f    // YF-S201 ~450 imp/L en théorie (voir étalonnage)
+#define TANK_CAPACITY_L   240.0f    // capacité fixe du réservoir
+#define MIN_FLOW_LPM      0.3f      // sous ce débit on AFFICHE 0 L/min (mais on compte !)
+#define DEBOUNCE_US       3000      // rejette les fronts < 3 ms
+// NB : DEBOUNCE_US plafonne le débit mesurable à ~333 imp/s,
+// soit ~41 L/min avec 485 imp/L. Suffisant pour un bateau.
+
+// CH422G : DI0 = EXIO0 (voir wiki Waveshare 4.3B)
+#define DI0_PIN           0
+
+// Temporisations
+#define SLEEP_AFTER_MS    300000UL  // veille : 5 min sans eau ni toucher
+#define SAVE_DELAY_MS     10000UL   // sauvegarde NVS 10 s après l'arrêt de l'eau
+#define REFILL_HOLD_MS    4000      // appui long pour "Réservoir rempli"
+
+// Interface
+#define BRIGHTNESS_MIN    10
+#define BRIGHTNESS_MAX    100
+#define DIM_MAX_OPA       204       // opacité max du voile noir (luminosité mini)
+
+// Réseau / OTA
+static const char *WIFI_SSID = "le nom de votre réseau wifi";
+static const char *WIFI_PASS = "mot de passe de votre wifi;
+static const char *OTA_HOST  = "compteur-eau";
+static const char *OTA_PASS  = "MdP de la carte renseigné pour la connexion au réseau";
+
+// ===================== ÉTAT =====================
+// Mesure
+static uint32_t pulseCount     = 0;
+static uint32_t lastPulses     = 0;
+static uint32_t lastPulsesSeen = 0;
+static uint32_t lastFlowCalc   = 0;
+static uint32_t lastFlowMs     = 0;     // dernier instant où de l'eau a coulé
+static float    totalLitres    = 0.0f;  // consommation cumulée
+static float    flowLpm        = 0.0f;
+
+// Drapeaux
+static bool uiDirty  = true;
+static bool unsaved  = false;
+static bool asleep   = false;
+static bool otaStarted = false;
+
+// Réglages persistants
+static uint8_t brightness = BRIGHTNESS_MAX;
+
+// Matériel
+static Preferences prefs;
+static Board *boardPtr = NULL;
+static esp_expander::CH422G *flowExpander = NULL;
+
+// Widgets
+static lv_obj_t *lblTotal, *lblRemaining, *lblFlow, *lblPercent, *lblBtn;
+static lv_obj_t *barTank;
+static lv_obj_t *dimLayer, *sleepCover;
+static lv_obj_t *blades[4];
+static lv_timer_t *refillTimer = NULL;
+static float turbAngle = 0.0f;
+
+// ===================== PERSISTANCE (NVS) =====================
+static void saveState() {
+    prefs.putFloat("total", totalLitres);
+    prefs.putUChar("bri", brightness);
+}
+
+static void loadState() {
+    prefs.begin("water", false);
+    totalLitres = prefs.getFloat("total", 0.0f);
+    brightness  = constrain(prefs.getUChar("bri", BRIGHTNESS_MAX),
+                            BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+    prefs.remove("cap");    // nettoie l'ancienne capacité enregistrée
+}
+
+// Redémarre le panneau RGB (corrige les décalages d'affichage après écriture flash)
+static void lcdRealign() {
+    if (boardPtr && boardPtr->getLCD())
+        esp_lcd_rgb_panel_restart(boardPtr->getLCD()->getHandle());
+}
+
+// ===================== LOGIQUE =====================
+static float remainingLitres() {
+    float r = TANK_CAPACITY_L - totalLitres;
+    return (r < 0) ? 0 : r;
+}
+
+static void updateMeasurements() {
+    uint32_t now = millis();
+    if (now - lastFlowCalc < 1000) return;
+
+    float dt = (now - lastFlowCalc) / 1000.0f;      // secondes
+    lastFlowCalc = now;
+
+    uint32_t p = pulseCount;
+    float litres = (p - lastPulses) / PULSES_PER_LITRE;
+    lastPulses = p;
+
+    // On accumule TOUJOURS les litres (même à petit débit) ;
+    // le seuil ne sert qu'à l'affichage.
+    totalLitres += litres;
+    flowLpm = litres * (60.0f / dt);
+    if (flowLpm < MIN_FLOW_LPM) flowLpm = 0.0f;
+
+    // Ne marquer "à sauvegarder" que si de l'eau a coulé (usure de la flash).
+    if (litres > 0.0f) unsaved = true;
+    uiDirty = true;
+}
+
+static void readSensor() {
+    // Le CH422G (capteur) et le tactile GT911 partagent le bus I2C, et la
+    // tâche LVGL lit le tactile en parallèle. Wire n'est pas thread-safe :
+    // le verrou LVGL sérialise les accès I2C entre loop() et cette tâche.
+    static bool     lastState  = false;
+    static uint32_t lastEdgeUs = 0;
+
+    lvgl_port_lock(-1);
+    bool state = flowExpander->digitalRead(DI0_PIN);
+    lvgl_port_unlock();
+
+    uint32_t nowUs = micros();
+    if (state && !lastState && (nowUs - lastEdgeUs) > DEBOUNCE_US) {
+        pulseCount++;
+        lastEdgeUs = nowUs;
+    }
+    lastState = state;
+}
+
+// ===================== VEILLE / LUMINOSITÉ =====================
+static void setSleep(bool s) {
+    asleep = s;
+    if (s) lv_obj_clear_flag(sleepCover, LV_OBJ_FLAG_HIDDEN);
+    else   lv_obj_add_flag(sleepCover, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void wakeCb(lv_event_t *) {
+    setSleep(false);
+    lastFlowMs = millis();
+}
+
+static void btnSleepCb(lv_event_t *) {
+    if (!asleep) setSleep(true);
+}
+
+static void applyBrightness() {
+    int range = BRIGHTNESS_MAX - BRIGHTNESS_MIN;
+    lv_obj_set_style_bg_opa(dimLayer,
+        (lv_opa_t)((BRIGHTNESS_MAX - brightness) * DIM_MAX_OPA / range), 0);
+}
+
+static void sliderBrightCb(lv_event_t *e) {
+    brightness = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+    applyBrightness();
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) unsaved = true;  // sauvegarde différée
+}
+
+// ===================== REMPLISSAGE =====================
+static void setRefillLabelIdle() {
+    lv_label_set_text(lblBtn, LV_SYMBOL_REFRESH "  Réservoir rempli");
+}
+
+static void refillDone(lv_timer_t *) {
+    refillTimer = NULL;
+    totalLitres = 0.0f;
+    lastPulses  = pulseCount;
+    saveState();
+    unsaved = false;
+    lcdRealign();
+    uiDirty = true;
+    setRefillLabelIdle();
+}
+
+static void btnRefillCb(lv_event_t *e) {
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_PRESSED:
+        if (refillTimer) lv_timer_del(refillTimer);
+        refillTimer = lv_timer_create(refillDone, REFILL_HOLD_MS, NULL);
+        lv_timer_set_repeat_count(refillTimer, 1);
+        lv_label_set_text(lblBtn, "Maintenir 4 s...");
+        break;
+    case LV_EVENT_RELEASED:
+    case LV_EVENT_PRESS_LOST:
+        if (refillTimer) {
+            lv_timer_del(refillTimer);
+            refillTimer = NULL;
+        }
+        setRefillLabelIdle();
+        break;
+    default:
+        break;
+    }
+}
+
+// ===================== TURBINE ANIMÉE =====================
+static void createTurbine(lv_obj_t *parent) {
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *a = lv_arc_create(parent);
+        lv_obj_remove_style(a, NULL, LV_PART_KNOB);              // pas de poignée
+        lv_obj_clear_flag(a, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(a, 64, 64);
+        lv_obj_align(a, LV_ALIGN_TOP_MID, -140, 208);
+        lv_arc_set_bg_angles(a, 0, 55);                          // une pale = 55°
+        lv_arc_set_rotation(a, i * 90);
+        lv_obj_set_style_bg_opa(a, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(a, 0, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(a, 28, LV_PART_MAIN);
+        lv_obj_set_style_arc_rounded(a, false, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(a, lv_color_hex(0x38BDF8), LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(a, LV_OPA_TRANSP, LV_PART_INDICATOR);
+        blades[i] = a;
+    }
+
+    lv_obj_t *hub = lv_obj_create(parent);                       // moyeu central
+    lv_obj_clear_flag(hub, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(hub, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(hub, 14, 14);
+    lv_obj_set_style_radius(hub, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(hub, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_width(hub, 0, 0);
+    lv_obj_align(hub, LV_ALIGN_TOP_MID, -140, 233);
+}
+
+static void turbineTick(lv_timer_t *) {
+    if (asleep || flowLpm < 0.2f) return;                        // pas d'eau : arrêt
+
+    float step = 2.0f + flowLpm * 1.8f;                          // degrés par image
+    if (step > 20.0f) step = 20.0f;
+    turbAngle += step;
+    if (turbAngle >= 360.0f) turbAngle -= 360.0f;
+
+    for (int i = 0; i < 4; i++)
+        lv_arc_set_rotation(blades[i], ((int)turbAngle + i * 90) % 360);
+}
+
+// ===================== INTERFACE LVGL =====================
+static lv_obj_t *makeGreyLabel(lv_obj_t *parent, const char *text,
+                               lv_align_t align, int x, int y) {
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_color(l, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_align(l, align, x, y);
+    return l;
+}
+
+static lv_obj_t *makeBigLabel(lv_obj_t *parent, lv_style_t *style, const char *text,
+                              lv_align_t align, int x, int y) {
+    lv_obj_t *l = lv_label_create(parent);
+    lv_obj_add_style(l, style, 0);
+    lv_label_set_text(l, text);
+    lv_obj_align(l, align, x, y);
+    return l;
+}
+
+static void createUI() {
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x101828), 0);
+    lv_obj_set_style_text_font(scr, &montserrat_14_acc, 0);
+
+    static lv_style_t stBig;
+    lv_style_init(&stBig);
+    lv_style_set_text_font(&stBig, &lv_font_montserrat_26);
+    lv_style_set_text_color(&stBig, lv_color_hex(0xFFFFFF));
+
+    // --- titre et chiffres clés ---
+    makeBigLabel(scr, &stBig, "Compteur d'eau", LV_ALIGN_TOP_MID, 0, 12);
+
+    makeGreyLabel(scr, "Consommation totale", LV_ALIGN_TOP_LEFT, 30, 70);
+    lblTotal = makeBigLabel(scr, &stBig, "0.00 L", LV_ALIGN_TOP_LEFT, 30, 95);
+
+    makeGreyLabel(scr, "Reste dans le réservoir", LV_ALIGN_TOP_RIGHT, -30, 70);
+    lblRemaining = makeBigLabel(scr, &stBig, "0.00 L", LV_ALIGN_TOP_RIGHT, -30, 95);
+
+    // --- jauge de niveau ---
+    barTank = lv_bar_create(scr);
+    lv_obj_set_size(barTank, 400, 36);
+    lv_bar_set_range(barTank, 0, 100);
+    lv_obj_set_style_bg_color(barTank, lv_color_hex(0x9CA3AF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(barTank, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(barTank, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(barTank, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_radius(barTank, 18, LV_PART_MAIN);
+    lv_obj_set_style_radius(barTank, 18, LV_PART_INDICATOR);
+    lv_obj_align(barTank, LV_ALIGN_TOP_MID, 0, 160);
+
+    lblPercent = lv_label_create(scr);
+    lv_obj_add_style(lblPercent, &stBig, 0);
+    lv_obj_set_style_text_color(lblPercent, lv_color_hex(0x101828), 0);
+    lv_obj_set_width(lblPercent, 400);
+    lv_obj_set_style_text_align(lblPercent, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(lblPercent, "100 %");
+    lv_obj_align_to(lblPercent, barTank, LV_ALIGN_CENTER, 0, 0);
+
+    lblFlow = makeBigLabel(scr, &stBig, "0.00 L/min", LV_ALIGN_TOP_MID, 0, 225);
+
+    // --- bouton "Réservoir rempli" et tuile capacité ---
+    const lv_color_t tileColor = lv_color_hex(0x38BDF8);
+    const lv_color_t tileText  = lv_color_hex(0x101828);
+    const int        tileRadius = 30;
+
+    lv_obj_t *btn = lv_btn_create(scr);
+    lv_obj_set_size(btn, 240, 60);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, -130, -40);
+    lv_obj_set_style_bg_color(btn, tileColor, 0);
+    lv_obj_set_style_radius(btn, tileRadius, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_add_event_cb(btn, btnRefillCb, LV_EVENT_ALL, NULL);
+    lblBtn = lv_label_create(btn);
+    setRefillLabelIdle();
+    lv_obj_set_style_text_color(lblBtn, tileText, 0);
+    lv_obj_center(lblBtn);
+
+    lv_obj_t *capTile = lv_obj_create(scr);
+    lv_obj_remove_style_all(capTile);
+    lv_obj_set_size(capTile, 240, 60);
+    lv_obj_align(capTile, LV_ALIGN_BOTTOM_MID, 130, -40);
+    lv_obj_set_style_bg_color(capTile, tileColor, 0);
+    lv_obj_set_style_bg_opa(capTile, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(capTile, tileRadius, 0);
+    lv_obj_clear_flag(capTile, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lblCap = lv_label_create(capTile);
+    lv_label_set_text_fmt(lblCap, "Capacité (L)  %d", (int)TANK_CAPACITY_L);
+    lv_obj_set_style_text_font(lblCap, &montserrat_14_acc, 0);
+    lv_obj_set_style_text_color(lblCap, tileText, 0);
+    lv_obj_center(lblCap);
+
+    // --- turbine ---
+    createTurbine(scr);
+    lv_timer_create(turbineTick, 40, NULL);
+
+    // --- luminosité ---
+    makeGreyLabel(scr, "Luminosité", LV_ALIGN_TOP_MID, 0, 290);
+
+    lv_obj_t *sl = lv_slider_create(scr);
+    lv_obj_set_width(sl, 300);
+    lv_slider_set_range(sl, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+    lv_slider_set_value(sl, brightness, LV_ANIM_OFF);
+    lv_obj_align(sl, LV_ALIGN_TOP_MID, 0, 325);
+    lv_obj_add_event_cb(sl, sliderBrightCb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(sl, sliderBrightCb, LV_EVENT_RELEASED, NULL);
+
+    // --- bouton de mise en veille manuelle (à gauche du curseur) ---
+    lv_obj_t *btnSleep = lv_btn_create(scr);
+    lv_obj_set_size(btnSleep, 50, 50);
+    lv_obj_align_to(btnSleep, sl, LV_ALIGN_OUT_LEFT_MID, -20, 0);
+    lv_obj_set_style_bg_color(btnSleep, lv_color_hex(0x334155), 0);
+    lv_obj_set_style_radius(btnSleep, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_shadow_width(btnSleep, 0, 0);
+    lv_obj_add_event_cb(btnSleep, btnSleepCb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lblSleep = lv_label_create(btnSleep);
+    lv_label_set_text(lblSleep, LV_SYMBOL_POWER);
+    lv_obj_set_style_text_color(lblSleep, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(lblSleep);
+
+    // --- calques supérieurs (l'ordre compte : la veille doit être au-dessus) ---
+    dimLayer = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(dimLayer);
+    lv_obj_set_size(dimLayer, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(dimLayer, lv_color_black(), 0);
+    lv_obj_clear_flag(dimLayer, LV_OBJ_FLAG_CLICKABLE);
+    applyBrightness();
+
+    sleepCover = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(sleepCover);
+    lv_obj_set_size(sleepCover, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(sleepCover, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(sleepCover, LV_OPA_COVER, 0);
+    lv_obj_add_flag(sleepCover, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(sleepCover, wakeCb, LV_EVENT_PRESSED, NULL);
+}
+
+// Rouge (<=20 %) -> jaune (60 %) -> vert (100 %)
+static lv_color_t levelColor(int pct) {
+    const lv_color_t green  = lv_color_hex(0x22C55E);
+    const lv_color_t yellow = lv_color_hex(0xFACC15);
+    const lv_color_t red    = lv_color_hex(0xEF4444);
+
+    if (pct <= 20)  return red;
+    if (pct >= 100) return green;
+
+    // lv_color_mix(c1, c2, m) = c1 pour m=0, c2 pour m=255
+    if (pct >= 60)
+        return lv_color_mix(yellow, green, (uint8_t)((pct - 60) * 255 / 40));
+    return lv_color_mix(red, yellow, (uint8_t)((pct - 20) * 255 / 40));
+}
+
+// Formate "12.34 <unit>" sans passer par %f
+static void formatValue(char *buf, size_t len, float v, const char *unit) {
+    lv_snprintf(buf, len, "%d.%02d %s", (int)v, (int)((v - (int)v) * 100), unit);
+}
+
+static void updateUI() {
+    char buf[48];
+
+    formatValue(buf, sizeof(buf), totalLitres, "L");
+    lv_label_set_text(lblTotal, buf);
+
+    float rem = remainingLitres();
+    formatValue(buf, sizeof(buf), rem, "L");
+    lv_label_set_text(lblRemaining, buf);
+
+    int pct = constrain((int)(rem / TANK_CAPACITY_L * 100.0f), 0, 100);
+    lv_bar_set_value(barTank, pct, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(barTank, levelColor(pct), LV_PART_INDICATOR);
+    lv_snprintf(buf, sizeof(buf), "%d %%", pct);
+    lv_label_set_text(lblPercent, buf);
+
+    formatValue(buf, sizeof(buf), flowLpm, "L/min");
+    lv_label_set_text(lblFlow, buf);
+}
+
+// ===================== SETUP / LOOP =====================
+static void initBoard() {
+    Board *board = new Board();
+    boardPtr = board;
+    board->init();
+
+#if LVGL_PORT_AVOID_TEARING_MODE
+    auto lcd = board->getLCD();
+    lcd->configFrameBufferNumber(LVGL_PORT_DISP_BUFFER_NUM);
+#if ESP_PANEL_DRIVERS_BUS_ENABLE_RGB && CONFIG_IDF_TARGET_ESP32S3
+    auto lcd_bus = lcd->getBus();
+    if (lcd_bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
+        static_cast<BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(lcd->getFrameWidth() * 10);
+    }
+#endif
+#endif
+    assert(board->begin());
+
+    // CH422G déjà géré par la Board : on passe ses IO en entrée
+    flowExpander = static_cast<esp_expander::CH422G *>(board->getExpander());
+    if (flowExpander) {
+        flowExpander->enableAllIO_Input();
+        Serial.println("CH422G : entrées IO0-IO7 configurées, lecture de DI0 activée");
+    } else {
+        Serial.println("ERREUR : CH422G introuvable");
+    }
+
+    lvgl_port_init(board->getLCD(), board->getTouch());
+}
+  
+
+
+static void initWifiOta() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    ArduinoOTA.setHostname(OTA_HOST);
+    ArduinoOTA.setPassword(OTA_PASS);
+    ArduinoOTA.onStart([]() { saveState(); });   // sauve la consommation avant mise à jour
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("Compteur d'eau : démarrage");
+
+    loadState();
+    initBoard();
+
+    lvgl_port_lock(-1);
+    createUI();
+    updateUI();
+    lvgl_port_unlock();
+
+    lastFlowCalc = lastFlowMs = millis();
+    initWifiOta();
+    Serial.println("Compteur d'eau prêt");
+    lastFlowCalc = millis();
+
+    // ---- Wi-Fi et mise à jour OTA ----
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    int n = WiFi.scanNetworks();
+    Serial.printf("Reseaux trouves : %d\n", n);
+    for (int i = 0; i < n; i++) {
+        Serial.printf("  %d : \"%s\"  (%d dBm)\n", i + 1, WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+    }
+
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    ArduinoOTA.setHostname("compteur-eau");
+    ArduinoOTA.setPassword("choisis-un-mot-de-passe");
+    ArduinoOTA.onStart([]() { saveState(); });
+
+    Serial.println("Compteur d'eau prêt");
+}
+    
+
+void loop()
+{
+    if (flowExpander) readSensor();
+
+    // Eau qui coule : l'écran se rallume tout de suite
+    if (pulseCount != lastPulsesSeen) {
+        lastPulsesSeen = pulseCount;
+        lastFlowMs = millis();
+        if (asleep) {
+            lvgl_port_lock(-1);
+            setSleep(false);
+            lvgl_port_unlock();
+            Serial.println("réveil : eau");
+        }
+    }
+
+    // Veille après un délai sans eau ni toucher
+    if (!asleep && millis() - lastFlowMs > SLEEP_AFTER_MS) {
+        lvgl_port_lock(-1);
+        bool idle = lv_disp_get_inactive_time(NULL) > SLEEP_AFTER_MS;
+        if (idle) setSleep(true);
+        lvgl_port_unlock();
+        if (idle) Serial.println("veille");
+    }
+
+    // OTA : démarrage dès que le Wi-Fi est connecté
+    if (!otaStarted && WiFi.status() == WL_CONNECTED) {
+        ArduinoOTA.begin();
+        otaStarted = true;
+        Serial.println(WiFi.localIP());
+    }
+    if (otaStarted) ArduinoOTA.handle();
+
+    // Sauvegarde différée : écrite une seule fois, eau arrêtée depuis 10 s
+    if (unsaved && millis() - lastFlowMs > SAVE_DELAY_MS) {
+        saveState();
+        lcdRealign();
+        unsaved = false;
+    }
+static uint32_t lastWifiMsg = 0;
+if (!otaStarted && millis() - lastWifiMsg > 5000) {
+    lastWifiMsg = millis();
+    Serial.printf("Wi-Fi statut = %d\n", (int)WiFi.status());
+}
+   
+    updateMeasurements();
+
+    if (uiDirty) {
+        lvgl_port_lock(-1);
+        updateUI();
+        lvgl_port_unlock();
+        uiDirty = false;
+    }
+
+    delay(1);
+}
